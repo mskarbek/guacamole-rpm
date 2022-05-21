@@ -1,0 +1,67 @@
+name: RHEL 9.0
+on:
+  push:
+    branches: 
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build RPMs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 2
+      - name: Download guacamole-server
+        run: |
+          curl -sLo guacamole-server-1.4.0.tar.gz https://apache.org/dyn/closer.lua/guacamole/1.4.0/source/guacamole-server-1.4.0.tar.gz?action=download
+      - name: Pull conainer image
+        run: |
+          docker pull registry.access.redhat.com/ubi9/ubi:9.0.0
+      - name: Run conainer
+        run: |
+          mkdir -vp $(pwd)/build
+          docker run -d -v $(pwd)/build:/build --name builder registry.access.redhat.com/ubi9/ubi:9.0.0 sleep 60m
+      - name: Register conainer
+        run: |
+          docker exec builder rm -vf /etc/rhsm-host /etc/pki/entitlement-host /etc/yum.repos.d/ubi.repo
+          docker exec -e SMDEV_CONTAINER_OFF=True builder subscription-manager register --username=${RHSN_USER} --password=${RHSN_PASS} --name=gh-guacamole-server-builder-9.0
+          docker exec builder sed -i 's/sslcacert.*/sslcacert = \/etc\/rhsm\/ca\/redhat-uep\.pem/g' /etc/yum.repos.d/redhat.repo
+        env:
+          RHSN_USER: ${{ secrets.RHSN_USER }}
+          RHSN_PASS: ${{ secrets.RHSN_PASS }}
+      - name: Update conainer
+        run: |
+          docker exec builder dnf -qy --disableplugin=subscription-manager update
+      - name: Install build dependencies
+        run: |
+          docker exec builder dnf -y --disableplugin=subscription-manager --enablerepo=codeready-builder-for-rhel-9-x86_64-rpms install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm
+          docker exec builder dnf -y --disableplugin=subscription-manager --enablerepo=codeready-builder-for-rhel-9-x86_64-rpms install cairo-devel libjpeg-turbo-devel libpng-devel libtool libuuid-devel freerdp-devel pango-devel libssh2-devel libtelnet-devel libvncserver-devel libwebsockets-devel pulseaudio-libs-devel openssl-devel libwebp-devel libvorbis-devel ffmpeg-devel rpm-build make gcc
+      - name: Add build user
+        run: |
+          docker exec builder useradd mockbuild
+      - name: Build source RPM
+        run: |
+          docker exec builder mkdir -vp /home/mockbuild/rpmbuild/{SOURCES,SPECS}
+          docker cp guacamole-server-1.4.0.tar.gz builder:/home/mockbuild/rpmbuild/SOURCES/
+          docker cp guacd.conf builder:/home/mockbuild/rpmbuild/SOURCES/
+          docker cp guacamole-server.spec builder:/home/mockbuild/rpmbuild/SPECS/
+          docker exec builder chown -Rv mockbuild:mockbuild /build
+          docker exec builder chown -Rv mockbuild:mockbuild /home/mockbuild/rpmbuild
+          docker exec -u mockbuild builder rpmbuild -bs /home/mockbuild/rpmbuild/SPECS/guacamole-server.spec
+          docker exec -u mockbuild builder mv -v /home/mockbuild/rpmbuild/SRPMS/guacamole-server-1.4.0-1.el9.src.rpm /build/
+          docker exec builder rm -rvf /home/mockbuild/rpmbuild
+      - name: Build RPMs
+        run:  |
+          docker exec -u mockbuild builder rpmbuild --rebuild /build/guacamole-server-1.4.0-1.el9.src.rpm
+          docker exec -u mockbuild builder bash -c "mv -v /home/mockbuild/rpmbuild/RPMS/x86_64/*.rpm /build/"
+      - name: Add release
+        run: |
+          ls -1 $(pwd)/build/
+          gh release create -t "Apache Guacamole 1.4.0: RHEL 9.0" --target ${GITHUB_SHA} v1.4.0-rhel9.0 $(pwd)/build/*.rpm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
